@@ -166,6 +166,363 @@ fn lock_file_shared_conflict_unlock_and_reacquire() {
 
 #[cfg(windows)]
 #[test]
+fn lock_file_shared_shared_coexist() {
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+
+    let mut driver = Proactor::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lock.tmp");
+    std::fs::File::create(&path).unwrap();
+    let first = open_lock_test_handle(&path);
+    let second = open_lock_test_handle(&path);
+    let contender = open_lock_test_handle(&path);
+    attach_lock_handles(&mut driver, &[&first, &second, &contender]);
+
+    push_and_wait_lock(&mut driver, TryLockFile::shared(first.clone(), 32, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, TryLockFile::shared(second.clone(), 32, 8))
+        .0
+        .unwrap();
+    let conflict = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 32, 8),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(conflict.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+
+    push_and_wait_lock(&mut driver, UnlockFile::new(first.clone(), 32, 8))
+        .0
+        .unwrap();
+    let conflict = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 32, 8),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(conflict.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+
+    push_and_wait_lock(&mut driver, UnlockFile::new(second.clone(), 32, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 32, 8),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 32, 8))
+        .0
+        .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn lock_file_exclusive_conflicts_with_shared_and_exclusive() {
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+
+    let mut driver = Proactor::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lock.tmp");
+    std::fs::File::create(&path).unwrap();
+    let owner = open_lock_test_handle(&path);
+    let contender = open_lock_test_handle(&path);
+    attach_lock_handles(&mut driver, &[&owner, &contender]);
+
+    push_and_wait_lock(&mut driver, TryLockFile::exclusive(owner.clone(), 48, 8))
+        .0
+        .unwrap();
+    for result in [
+        push_and_wait_lock(&mut driver, TryLockFile::shared(contender.clone(), 48, 8)),
+        push_and_wait_lock(
+            &mut driver,
+            TryLockFile::exclusive(contender.clone(), 48, 8),
+        ),
+    ] {
+        let error = result.0.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+    }
+
+    push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 48, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, TryLockFile::shared(contender.clone(), 48, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 48, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 48, 8),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 48, 8))
+        .0
+        .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn lock_file_same_handle_exclusive_then_shared_unlocks_exclusive_first() {
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+
+    let mut driver = Proactor::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lock.tmp");
+    std::fs::File::create(&path).unwrap();
+    let owner = open_lock_test_handle(&path);
+    let contender = open_lock_test_handle(&path);
+    attach_lock_handles(&mut driver, &[&owner, &contender]);
+
+    push_and_wait_lock(&mut driver, TryLockFile::exclusive(owner.clone(), 80, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, TryLockFile::shared(owner.clone(), 80, 8))
+        .0
+        .unwrap();
+    let conflict = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 80, 8),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(conflict.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+
+    push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 80, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, TryLockFile::shared(contender.clone(), 80, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 80, 8))
+        .0
+        .unwrap();
+    let conflict = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 80, 8),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(conflict.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+
+    push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 80, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 80, 8),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 80, 8))
+        .0
+        .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn lock_file_adjacent_and_disjoint_ranges_are_independent() {
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+
+    let mut driver = Proactor::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lock.tmp");
+    std::fs::File::create(&path).unwrap();
+    let owner = open_lock_test_handle(&path);
+    let contender = open_lock_test_handle(&path);
+    attach_lock_handles(&mut driver, &[&owner, &contender]);
+
+    push_and_wait_lock(&mut driver, TryLockFile::exclusive(owner.clone(), 10, 10))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, TryLockFile::exclusive(owner.clone(), 20, 10))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, TryLockFile::exclusive(owner.clone(), 50, 10))
+        .0
+        .unwrap();
+    let error = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 20, 10),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+    let error = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 50, 10),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 30, 10),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 70, 10),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 30, 10))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 70, 10))
+        .0
+        .unwrap();
+
+    push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 10, 10))
+        .0
+        .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 10, 10),
+    )
+    .0
+    .unwrap();
+    let conflict = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 50, 10),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(conflict.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 10, 10))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 20, 10))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 50, 10))
+        .0
+        .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 20, 10),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 20, 10))
+        .0
+        .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 50, 10),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 50, 10))
+        .0
+        .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn unlock_file_requires_exact_range_and_preserves_other_lock() {
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_NOT_LOCKED};
+
+    let mut driver = Proactor::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lock.tmp");
+    std::fs::File::create(&path).unwrap();
+    let owner = open_lock_test_handle(&path);
+    let contender = open_lock_test_handle(&path);
+    attach_lock_handles(&mut driver, &[&owner, &contender]);
+
+    push_and_wait_lock(&mut driver, TryLockFile::exclusive(owner.clone(), 96, 16))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, TryLockFile::exclusive(owner.clone(), 160, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, TryLockFile::exclusive(owner.clone(), 200, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, TryLockFile::exclusive(owner.clone(), 208, 8))
+        .0
+        .unwrap();
+
+    let error = push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 95, 16))
+        .0
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_NOT_LOCKED as _));
+    let error = push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 96, 8))
+        .0
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_NOT_LOCKED as _));
+    let error = push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 200, 16))
+        .0
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_NOT_LOCKED as _));
+    for offset in [96, 160, 200, 208] {
+        let error = push_and_wait_lock(
+            &mut driver,
+            TryLockFile::exclusive(contender.clone(), offset, 1),
+        )
+        .0
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+    }
+
+    push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 96, 16))
+        .0
+        .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 96, 16),
+    )
+    .0
+    .unwrap();
+    let error = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 160, 1),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+
+    push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 160, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 200, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 208, 8))
+        .0
+        .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 96, 16))
+        .0
+        .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 160, 8),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 160, 8))
+        .0
+        .unwrap();
+    for offset in [200, 208] {
+        push_and_wait_lock(
+            &mut driver,
+            TryLockFile::exclusive(contender.clone(), offset, 8),
+        )
+        .0
+        .unwrap();
+        push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), offset, 8))
+            .0
+            .unwrap();
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn lock_file_splits_high_offset_bits() {
     use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
 
@@ -213,6 +570,113 @@ fn lock_file_splits_high_offset_bits() {
     push_and_wait_lock(
         &mut driver,
         UnlockFile::new(contender.clone(), high_offset, 8),
+    )
+    .0
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn lock_file_splits_high_length_bits() {
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+
+    let mut driver = Proactor::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lock.tmp");
+    std::fs::File::create(&path).unwrap();
+    let owner = open_lock_test_handle(&path);
+    let contender = open_lock_test_handle(&path);
+    attach_lock_handles(&mut driver, &[&owner, &contender]);
+    let high_length = (1_u64 << 32) + 0x100;
+    let high_offset = (1_u64 << 32) + 0x80;
+
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(owner.clone(), 0, high_length),
+    )
+    .0
+    .unwrap();
+    let conflict = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), high_offset, 1),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(conflict.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), high_length, 1),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        UnlockFile::new(contender.clone(), high_length, 1),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 0, high_length))
+        .0
+        .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), high_offset, 1),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        UnlockFile::new(contender.clone(), high_offset, 1),
+    )
+    .0
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn unlock_file_splits_high_length_bits() {
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_NOT_LOCKED};
+
+    let mut driver = Proactor::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lock.tmp");
+    std::fs::File::create(&path).unwrap();
+    let owner = open_lock_test_handle(&path);
+    let contender = open_lock_test_handle(&path);
+    attach_lock_handles(&mut driver, &[&owner, &contender]);
+    let high_length = (1_u64 << 32) + 0x100;
+    let high_offset = (1_u64 << 32) + 0x80;
+
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(owner.clone(), 0, high_length),
+    )
+    .0
+    .unwrap();
+    let error = push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 0, 0x100))
+        .0
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_NOT_LOCKED as _));
+    let conflict = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), high_offset, 1),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(conflict.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+
+    push_and_wait_lock(&mut driver, UnlockFile::new(owner.clone(), 0, high_length))
+        .0
+        .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), high_offset, 1),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        UnlockFile::new(contender.clone(), high_offset, 1),
     )
     .0
     .unwrap();
