@@ -12,7 +12,10 @@ use compio_driver::{
     op::{BufResultExt, CloseFile, ReadAt, ReadManagedAt, Sync, WriteAt},
 };
 #[cfg(windows)]
-use compio_driver::{OpCode, OpType, op::TryLockFile};
+use compio_driver::{
+    OpCode, OpType,
+    op::{TryLockFile, UnlockFile},
+};
 use compio_io::{AsyncReadAt, AsyncReadManagedAt, AsyncWriteAt, util::Splittable};
 use compio_runtime::{Runtime, fd::AsyncFd};
 #[cfg(all(unix, not(solarish)))]
@@ -137,6 +140,44 @@ impl File {
                 } else {
                     TryLockFile::shared(fd, offset, length)
                 },
+                reservation: Some(reservation),
+            };
+            Ok(runtime.submit(op))
+        })?;
+        submit.await.0.map(|_| ())
+    }
+
+    /// Releases one acquisition of an exact byte range held through this file
+    /// owner.
+    ///
+    /// Shared acquisitions are released one at a time. An exclusive acquisition
+    /// is released before any shared acquisitions of the same range. If the
+    /// future is dropped after submission, the held state is updated only when
+    /// the driver reports successful completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] for an empty or overflowing
+    /// range, [`io::ErrorKind::WouldBlock`] if the exact range is not currently
+    /// releasable through this file owner, and preserves operating-system
+    /// errors.
+    #[cfg(windows)]
+    pub async fn unlock(&self, offset: u64, length: u64) -> io::Result<()> {
+        if length == 0 || offset.checked_add(length).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "byte range must be nonempty and fit in u64",
+            ));
+        }
+        let submit = Runtime::with_current(|runtime| {
+            let Some(reservation) = self.locks.try_reserve_release(offset, length) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "byte range is not releasable through this File",
+                ));
+            };
+            let op = UnlockFileOp {
+                inner: UnlockFile::new(self.to_shared_fd(), offset, length),
                 reservation: Some(reservation),
             };
             Ok(runtime.submit(op))
@@ -483,6 +524,56 @@ unsafe impl OpCode for TryLockFileOp {
 }
 
 #[cfg(windows)]
+// SAFETY: the wrapper retains and delegates the same driver operation for
+// the runtime-owned operation lifetime. It forwards the runtime control,
+// OVERLAPPED storage, cancellation, and completion result unchanged.
+unsafe impl OpCode for UnlockFileOp {
+    type Control = ();
+
+    fn op_type(&self, control: &Self::Control) -> OpType {
+        self.inner.op_type(control)
+    }
+
+    unsafe fn operate(
+        &mut self,
+        control: &mut Self::Control,
+        overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+    ) -> std::task::Poll<io::Result<usize>> {
+        // SAFETY: the wrapped driver operation owns the same fd and relies on
+        // the IOCP operation storage retained by the runtime.
+        unsafe { self.inner.operate(control, overlapped) }
+    }
+
+    fn cancel(
+        &mut self,
+        control: &mut Self::Control,
+        overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+    ) -> io::Result<()> {
+        self.inner.cancel(control, overlapped)
+    }
+
+    unsafe fn set_result(
+        &mut self,
+        control: &mut Self::Control,
+        result: &io::Result<usize>,
+        extra: &compio_driver::Extra,
+    ) {
+        // SAFETY: the result and extra are delivered by the runtime for this
+        // wrapped operation, matching the driver's OpCode contract.
+        unsafe { self.inner.set_result(control, result, extra) };
+        if let Some(mut reservation) = self.reservation.take() {
+            reservation.complete(result.is_ok());
+        }
+    }
+}
+
+#[cfg(windows)]
+struct UnlockFileOp {
+    inner: UnlockFile<compio_driver::SharedFd<std::fs::File>>,
+    reservation: Option<crate::locks::LockReleaseReservation>,
+}
+
+#[cfg(windows)]
 struct TryLockFileOp {
     inner: TryLockFile<compio_driver::SharedFd<std::fs::File>>,
     reservation: Option<crate::locks::LockReservation>,
@@ -633,6 +724,110 @@ mod tests {
         );
     }
 
+    #[compio_macros::test]
+    async fn discarded_queued_unlock_keeps_state_until_success_completion() {
+        let tempfile = tempfile::NamedTempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tempfile.path())
+            .await
+            .unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tempfile.path())
+            .await
+            .unwrap();
+        file.try_lock_exclusive(64, 4).await.unwrap();
+
+        let reservation = file.locks.try_reserve_release(64, 4).unwrap();
+        let queued = Rc::new(Cell::new(false));
+        let completed = Rc::new(Cell::new(false));
+        let op = ControlledUnlockCompletion {
+            inner: UnlockFileOp {
+                inner: UnlockFile::new(file.to_shared_fd(), 64, 4),
+                reservation: Some(reservation),
+            },
+            completion_port: Runtime::with_current(|runtime| runtime.as_raw_fd()),
+            queued: queued.clone(),
+            completed: completed.clone(),
+        };
+        let mut submit = Box::pin(Runtime::with_current(|runtime| runtime.submit(op)));
+        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
+
+        assert!(submit.as_mut().poll(&mut context).is_pending());
+        assert!(
+            queued.get(),
+            "real unlock success must queue the controlled packet"
+        );
+        assert!(!completed.get(), "unlock state must wait for completion");
+        assert_eq!(file.locks.count_at(68), Some(1));
+        drop(submit);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !completed.get() {
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "controlled unlock completion was not observed"
+            );
+            let timeout = (deadline - now).min(Duration::from_millis(100));
+            Runtime::with_current(|runtime| runtime.poll_with(Some(timeout)));
+        }
+
+        assert!(completed.get());
+        assert_eq!(file.locks.count_at(68), None);
+        contender.try_lock_exclusive(64, 4).await.unwrap();
+    }
+
+    #[compio_macros::test]
+    async fn controlled_unlock_callback_error_keeps_state_and_allows_retry() {
+        use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_OPERATION_ABORTED};
+
+        let tempfile = tempfile::NamedTempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tempfile.path())
+            .await
+            .unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tempfile.path())
+            .await
+            .unwrap();
+        file.try_lock_exclusive(72, 4).await.unwrap();
+
+        let reservation = file.locks.try_reserve_release(72, 4).unwrap();
+        let callback_completed = Rc::new(Cell::new(false));
+        let submit = Runtime::with_current(|runtime| {
+            runtime.submit(ControlledUnlockCallbackError {
+                inner: UnlockFileOp {
+                    inner: UnlockFile::new(file.to_shared_fd(), 72, 4),
+                    reservation: Some(reservation),
+                },
+                error: ERROR_OPERATION_ABORTED as i32,
+                callback_completed: callback_completed.clone(),
+            })
+        });
+
+        // This controlled operation supplies an OS error without submitting
+        // native I/O, so it proves callback reconciliation without claiming
+        // native Pending or cancellation behavior.
+        let error = submit.await.0.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_OPERATION_ABORTED as i32));
+        assert!(callback_completed.get());
+        assert_eq!(file.locks.test_state_at(76), Some((1, true, 0, false)));
+        let error = contender.try_lock_exclusive(72, 4).await.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as i32));
+
+        file.unlock(72, 4).await.unwrap();
+        assert_eq!(file.locks.test_state_at(76), None);
+        contender.try_lock_exclusive(72, 4).await.unwrap();
+    }
+
     struct ControlledTryLockCompletion {
         inner: TryLockFileOp,
         completion_port: compio_driver::RawFd,
@@ -663,6 +858,126 @@ mod tests {
                     // SAFETY: `overlapped` is live runtime-owned storage and
                     // the accepted driver test uses this controlled packet
                     // pattern only after the real syscall has completed.
+                    unsafe {
+                        (*overlapped).Internal = 0;
+                        (*overlapped).InternalHigh = 0;
+                    }
+                    // SAFETY: this port belongs to the runtime supplying the
+                    // OVERLAPPED pointer, which remains owned until dequeue.
+                    let posted = unsafe {
+                        windows_sys::Win32::System::IO::PostQueuedCompletionStatus(
+                            self.completion_port as _,
+                            0,
+                            0,
+                            overlapped,
+                        )
+                    };
+                    if posted == 0 {
+                        std::task::Poll::Ready(Err(io::Error::last_os_error()))
+                    } else {
+                        self.queued.set(true);
+                        std::task::Poll::Pending
+                    }
+                }
+                result => result,
+            }
+        }
+
+        fn cancel(
+            &mut self,
+            control: &mut Self::Control,
+            overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+        ) -> io::Result<()> {
+            self.inner.cancel(control, overlapped)
+        }
+
+        unsafe fn set_result(
+            &mut self,
+            control: &mut Self::Control,
+            result: &io::Result<usize>,
+            extra: &compio_driver::Extra,
+        ) {
+            // SAFETY: completion is delivered by the runtime for this wrapper
+            // and is forwarded to the same retained driver operation.
+            unsafe { self.inner.set_result(control, result, extra) };
+            self.completed.set(self.inner.reservation.is_none());
+        }
+    }
+
+    struct ControlledUnlockCompletion {
+        inner: UnlockFileOp,
+        completion_port: compio_driver::RawFd,
+        queued: Rc<Cell<bool>>,
+        completed: Rc<Cell<bool>>,
+    }
+
+    struct ControlledUnlockCallbackError {
+        inner: UnlockFileOp,
+        error: i32,
+        callback_completed: Rc<Cell<bool>>,
+    }
+
+    // SAFETY: this test wrapper completes immediately and forwards the same
+    // operation storage to the callback; it does not submit native I/O.
+    unsafe impl OpCode for ControlledUnlockCallbackError {
+        type Control = ();
+
+        fn op_type(&self, control: &Self::Control) -> OpType {
+            self.inner.op_type(control)
+        }
+
+        unsafe fn operate(
+            &mut self,
+            _control: &mut Self::Control,
+            _overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Err(io::Error::from_raw_os_error(self.error)))
+        }
+
+        fn cancel(
+            &mut self,
+            control: &mut Self::Control,
+            overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+        ) -> io::Result<()> {
+            self.inner.cancel(control, overlapped)
+        }
+
+        unsafe fn set_result(
+            &mut self,
+            control: &mut Self::Control,
+            result: &io::Result<usize>,
+            extra: &compio_driver::Extra,
+        ) {
+            // SAFETY: the runtime invokes this callback with the same control
+            // and Extra that belong to the wrapped operation.
+            unsafe { self.inner.set_result(control, result, extra) };
+            self.callback_completed
+                .set(self.inner.reservation.is_none());
+        }
+    }
+
+    // SAFETY: the runtime retains this wrapper and its inner operation until
+    // it consumes the queued completion; every operation method forwards the
+    // same control, OVERLAPPED storage, and result to the inner operation.
+    unsafe impl OpCode for ControlledUnlockCompletion {
+        type Control = ();
+
+        fn op_type(&self, control: &Self::Control) -> OpType {
+            self.inner.op_type(control)
+        }
+
+        unsafe fn operate(
+            &mut self,
+            control: &mut Self::Control,
+            overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+        ) -> std::task::Poll<io::Result<usize>> {
+            // SAFETY: the runtime pins this operation and provides its live
+            // OVERLAPPED storage to both the real driver call and queued
+            // packet.
+            match unsafe { self.inner.operate(control, overlapped) } {
+                std::task::Poll::Ready(Ok(_)) => {
+                    // SAFETY: `overlapped` is live runtime-owned storage and
+                    // this controlled packet follows the successful syscall.
                     unsafe {
                         (*overlapped).Internal = 0;
                         (*overlapped).InternalHigh = 0;

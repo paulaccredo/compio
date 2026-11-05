@@ -6,6 +6,8 @@ struct LockRecord {
     length: u64,
     count: usize,
     exclusive: bool,
+    pending_acquisitions: usize,
+    release_pending: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -97,9 +99,20 @@ impl SharedLockMap {
         let mut state = self.state.lock().expect("lock poisoned");
         let end = range_end(offset, length)?;
 
+        if state.records.get(&end).is_some_and(|record| {
+            record.offset == offset && record.length == length && record.release_pending
+        }) {
+            return None;
+        }
+
         if !state.try_acquire(offset, length, exclusive) {
             return None;
         }
+        state
+            .records
+            .get_mut(&end)
+            .expect("successful acquisition reservation has a record")
+            .pending_acquisitions += 1;
 
         Some(LockReservation {
             owner: self.clone(),
@@ -108,6 +121,35 @@ impl SharedLockMap {
                 offset,
                 length,
                 exclusive,
+            }),
+        })
+    }
+
+    pub(super) fn try_reserve_release(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Option<LockReleaseReservation> {
+        let end = range_end(offset, length)?;
+        let mut state = self.state.lock().expect("lock poisoned");
+        let record = state.records.get_mut(&end)?;
+        if record.offset != offset
+            || record.length != length
+            || record.pending_acquisitions != 0
+            || !record.try_reserve_release()
+        {
+            return None;
+        }
+
+        // Keep the held count unchanged until the driver reports unlock
+        // success.
+        Some(LockReleaseReservation {
+            owner: self.clone(),
+            info: Some(ReservationInfo {
+                end,
+                offset,
+                length,
+                exclusive: false,
             }),
         })
     }
@@ -126,6 +168,23 @@ impl SharedLockMap {
             .get(&end)
             .map(|record| record.count)
     }
+
+    #[cfg(test)]
+    pub(super) fn test_state_at(&self, end: u64) -> Option<(usize, bool, usize, bool)> {
+        self.state
+            .lock()
+            .expect("lock poisoned")
+            .records
+            .get(&end)
+            .map(|record| {
+                (
+                    record.count,
+                    record.exclusive,
+                    record.pending_acquisitions,
+                    record.release_pending,
+                )
+            })
+    }
 }
 
 impl LockReservation {
@@ -142,6 +201,7 @@ impl LockReservation {
             return false;
         }
 
+        record.pending_acquisitions -= 1;
         // Only the native operation's reported outcome may undo its
         // reservation.
         if !succeeded {
@@ -155,6 +215,34 @@ impl LockReservation {
             state.records.remove(&reservation.end);
         }
 
+        true
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct LockReleaseReservation {
+    owner: SharedLockMap,
+    info: Option<ReservationInfo>,
+}
+
+impl LockReleaseReservation {
+    pub(super) fn complete(&mut self, succeeded: bool) -> bool {
+        let Some(reservation) = self.info.take() else {
+            return false;
+        };
+
+        let mut state = self.owner.state.lock().expect("lock poisoned");
+        let Some(record) = state.records.get_mut(&reservation.end) else {
+            return false;
+        };
+        if record.offset != reservation.offset || record.length != reservation.length {
+            return false;
+        }
+
+        record.finish_release(succeeded);
+        if record.count == 0 {
+            state.records.remove(&reservation.end);
+        }
         true
     }
 }
@@ -174,6 +262,8 @@ impl LockRecord {
             length,
             count: 1,
             exclusive,
+            pending_acquisitions: 0,
+            release_pending: false,
         }
     }
 
@@ -187,6 +277,22 @@ impl LockRecord {
         };
         self.count = count;
         true
+    }
+
+    fn try_reserve_release(&mut self) -> bool {
+        if self.release_pending {
+            return false;
+        }
+        self.release_pending = true;
+        true
+    }
+
+    fn finish_release(&mut self, succeeded: bool) {
+        self.release_pending = false;
+        if succeeded {
+            self.count -= 1;
+            self.exclusive = false;
+        }
     }
 
     #[cfg(test)]
@@ -616,6 +722,81 @@ mod tests {
         let before = owner.snapshot();
         assert!(!reservation.complete(false));
         assert_eq!(owner.snapshot(), before);
+    }
+
+    #[test]
+    fn release_reservation_does_not_mark_a_held_range_released_until_success() {
+        let owner = SharedLockMap::default();
+        let mut acquire = owner.try_reserve(4, 8, true).unwrap();
+        assert!(acquire.complete(true));
+        let before = owner.snapshot();
+        let mut release = owner.try_reserve_release(4, 8).unwrap();
+
+        let reserved = owner.snapshot();
+        let held_before = &before.records[&12];
+        let held_during = &reserved.records[&12];
+        assert_eq!(held_during.count, held_before.count);
+        assert_eq!(held_during.exclusive, held_before.exclusive);
+        assert_eq!(
+            held_during.pending_acquisitions,
+            held_before.pending_acquisitions
+        );
+        assert!(!held_before.release_pending);
+        assert!(held_during.release_pending);
+        assert!(owner.try_reserve(4, 8, false).is_none());
+        assert!(owner.try_reserve(5, 2, true).is_none());
+        assert!(release.complete(false));
+        assert_eq!(owner.snapshot(), before);
+        assert!(!release.complete(true));
+    }
+
+    #[test]
+    fn release_reservation_rejects_non_exact_and_in_flight_acquisitions() {
+        let owner = SharedLockMap::default();
+        let mut acquire = owner.try_reserve(4, 8, true).unwrap();
+
+        assert!(owner.try_reserve_release(5, 7).is_none());
+        assert!(owner.try_reserve_release(4, 8).is_none());
+        assert!(acquire.complete(true));
+        assert!(owner.try_reserve_release(4, 8).is_some());
+    }
+
+    #[test]
+    fn completed_release_applies_once_and_preserves_exclusive_first_order() {
+        let owner = SharedLockMap::default();
+        let mut exclusive = owner.try_reserve(4, 8, true).unwrap();
+        assert!(exclusive.complete(true));
+        let mut shared = owner.try_reserve(4, 8, false).unwrap();
+        assert!(shared.complete(true));
+
+        let mut first = owner.try_reserve_release(4, 8).unwrap();
+        assert!(first.complete(true));
+        assert!(!first.complete(true));
+        let record = &owner.snapshot().records[&12];
+        assert_eq!(record.count, 1);
+        assert!(!record.exclusive);
+
+        let mut second = owner.try_reserve_release(4, 8).unwrap();
+        assert!(second.complete(true));
+        assert!(owner.snapshot().records.is_empty());
+    }
+
+    #[test]
+    fn only_one_release_may_be_in_flight_for_a_range() {
+        let owner = SharedLockMap::default();
+        let mut first = owner.try_reserve(4, 8, false).unwrap();
+        assert!(first.complete(true));
+        let mut second = owner.try_reserve(4, 8, false).unwrap();
+        assert!(second.complete(true));
+
+        let mut release_one = owner.try_reserve_release(4, 8).unwrap();
+        assert!(owner.try_reserve_release(4, 8).is_none());
+        assert!(release_one.complete(false));
+        assert_eq!(owner.snapshot().records[&12].count, 2);
+
+        let mut retry = owner.try_reserve_release(4, 8).unwrap();
+        assert!(retry.complete(true));
+        assert_eq!(owner.snapshot().records[&12].count, 1);
     }
 
     #[test]

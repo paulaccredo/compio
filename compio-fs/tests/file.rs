@@ -307,6 +307,158 @@ async fn file_clones_share_lock_state_and_failed_acquire_keeps_it() {
 
 #[cfg(windows)]
 #[compio_macros::test]
+async fn unlock_releases_exclusive_before_shared_acquisitions() {
+    let tempfile = tempfile();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+
+    file.try_lock_exclusive(96, 4).await.unwrap();
+    file.try_lock_shared(96, 4).await.unwrap();
+    file.unlock(96, 4).await.unwrap();
+    assert!(contender.try_lock_exclusive(96, 4).await.is_err());
+    contender.try_lock_shared(96, 4).await.unwrap();
+
+    file.unlock(96, 4).await.unwrap();
+    contender.unlock(96, 4).await.unwrap();
+    contender.try_lock_exclusive(96, 4).await.unwrap();
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
+async fn repeated_shared_unlocks_preserve_remaining_count_and_other_ranges() {
+    let tempfile = tempfile();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+
+    file.try_lock_shared(104, 4).await.unwrap();
+    file.try_lock_shared(104, 4).await.unwrap();
+    file.try_lock_exclusive(120, 4).await.unwrap();
+    file.unlock(104, 4).await.unwrap();
+    assert!(contender.try_lock_exclusive(104, 4).await.is_err());
+    assert!(contender.try_lock_shared(120, 4).await.is_err());
+
+    file.unlock(104, 4).await.unwrap();
+    contender.try_lock_exclusive(104, 4).await.unwrap();
+    assert!(contender.try_lock_shared(120, 4).await.is_err());
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
+async fn unlock_requires_an_exact_held_range_and_preserves_native_errors() {
+    use compio_driver::{
+        ToSharedFd,
+        op::{TryLockFile, UnlockFile},
+    };
+    use compio_runtime::Runtime;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_NOT_LOCKED};
+
+    let tempfile = tempfile();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    file.try_lock_exclusive(136, 4).await.unwrap();
+
+    let error = file.unlock(136, 3).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    let error = file.unlock(140, 4).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    let error = file.unlock(137, 3).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    let error = contender.try_lock_exclusive(136, 4).await.unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as i32));
+
+    // Clear the native range through the retained driver operation while
+    // leaving File's completion-backed ownership record unchanged.
+    let native_unlock = Runtime::with_current(|runtime| {
+        runtime.submit(UnlockFile::new(file.to_shared_fd(), 136, 4))
+    });
+    native_unlock.await.0.unwrap();
+
+    let error = file.unlock(136, 4).await.unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_NOT_LOCKED as i32));
+    let error = file.unlock(136, 4).await.unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_NOT_LOCKED as i32));
+    let error = file.try_lock_exclusive(136, 4).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(error.raw_os_error(), None);
+
+    // Reacquire natively through the driver, then let public unlock reconcile
+    // the still-held map record from a real successful completion.
+    let native_lock = Runtime::with_current(|runtime| {
+        runtime.submit(TryLockFile::exclusive(file.to_shared_fd(), 136, 4))
+    });
+    native_lock.await.0.unwrap();
+    let error = contender.try_lock_exclusive(136, 4).await.unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as i32));
+    file.unlock(136, 4).await.unwrap();
+    contender.try_lock_exclusive(136, 4).await.unwrap();
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
+async fn dropping_unpolled_unlock_future_keeps_native_and_recorded_lock() {
+    let tempfile = tempfile();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    file.try_lock_exclusive(152, 4).await.unwrap();
+
+    let unlock = file.unlock(152, 4);
+    drop(unlock);
+
+    let error = file.try_lock_exclusive(152, 4).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(error.raw_os_error(), None);
+    let error = contender.try_lock_exclusive(152, 4).await.unwrap_err();
+    assert_eq!(
+        error.raw_os_error(),
+        Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+    );
+
+    file.unlock(152, 4).await.unwrap();
+    contender.try_lock_exclusive(152, 4).await.unwrap();
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
 async fn native_acquire_failure_can_retry_without_losing_sibling_lock() {
     use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
 
