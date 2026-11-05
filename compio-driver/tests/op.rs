@@ -700,6 +700,316 @@ fn unlock_file_preserves_os_failure() {
     assert_eq!(error.raw_os_error(), Some(ERROR_NOT_LOCKED as _));
 }
 
+#[cfg(windows)]
+#[test]
+fn lock_file_records_native_submission_state() {
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+
+    let mut driver = Proactor::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lock.tmp");
+    std::fs::File::create(&path).unwrap();
+    let owner = open_lock_test_handle(&path);
+    let contender = open_lock_test_handle(&path);
+    attach_lock_handles(&mut driver, &[&owner, &contender]);
+
+    let (submission, result) =
+        push_and_wait_lock_observing(&mut driver, TryLockFile::exclusive(owner.clone(), 32, 8));
+    eprintln!("native LockFileEx submission: {submission}");
+    result.0.unwrap();
+
+    let conflict = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 32, 8),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(conflict.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+
+    let (submission, result) =
+        push_and_wait_lock_observing(&mut driver, UnlockFile::new(owner.clone(), 32, 8));
+    eprintln!("native UnlockFileEx submission: {submission}");
+    result.0.unwrap();
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 32, 8),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 32, 8))
+        .0
+        .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn controlled_pending_lock_retains_descriptor_until_completion_after_cancel() {
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+
+    let mut driver = Proactor::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lock.tmp");
+    std::fs::File::create(&path).unwrap();
+    let owner = open_lock_test_handle(&path);
+    let contender = open_lock_test_handle(&path);
+    attach_lock_handles(&mut driver, &[&owner, &contender]);
+
+    let (submission, BufResult(result, operation)) =
+        push_and_wait_lock_observing(&mut driver, TryLockFile::exclusive(owner.clone(), 48, 8));
+    eprintln!("native LockFileEx submission for controlled retention: {submission}");
+    result.unwrap();
+
+    let op = ControlledRangeCompletion::lock(operation, driver.as_raw_fd());
+    let key = match driver.push(op) {
+        PushEntry::Pending(key) => key,
+        PushEntry::Ready(_) => panic!("controlled completion must return pending"),
+    };
+    let owner = match owner.try_unwrap() {
+        Err(owner) => owner,
+        Ok(_) => panic!("the controlled pending operation must retain its descriptor"),
+    };
+
+    let conflict = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 48, 8),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(conflict.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+
+    let token = driver.register_cancel(&key);
+    assert!(driver.cancel_token(token));
+    let conflict = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 48, 8),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(conflict.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+    let completion = wait_for_controlled_completion(&mut driver, key);
+    completion.0.unwrap();
+    drop(completion.1);
+    let owner_file = match owner.try_unwrap() {
+        Ok(file) => file,
+        Err(_) => panic!("the completed operation released its descriptor"),
+    };
+    let conflict = push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 48, 8),
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(conflict.raw_os_error(), Some(ERROR_LOCK_VIOLATION as _));
+    drop(owner_file);
+
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 48, 8),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 48, 8))
+        .0
+        .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn controlled_pending_unlock_cancel_reports_actual_range_state() {
+    let mut driver = Proactor::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lock.tmp");
+    std::fs::File::create(&path).unwrap();
+    let owner = open_lock_test_handle(&path);
+    let contender = open_lock_test_handle(&path);
+    attach_lock_handles(&mut driver, &[&owner, &contender]);
+
+    push_and_wait_lock(&mut driver, TryLockFile::exclusive(owner.clone(), 64, 8))
+        .0
+        .unwrap();
+
+    let (submission, BufResult(result, operation)) =
+        push_and_wait_lock_observing(&mut driver, UnlockFile::new(owner.clone(), 64, 8));
+    eprintln!("native UnlockFileEx submission for controlled retention: {submission}");
+    result.unwrap();
+
+    let op = ControlledRangeCompletion::unlock(operation, driver.as_raw_fd());
+    let key = match driver.push(op) {
+        PushEntry::Pending(key) => key,
+        PushEntry::Ready(_) => panic!("controlled completion must return pending"),
+    };
+    let owner = match owner.try_unwrap() {
+        Err(owner) => owner,
+        Ok(_) => panic!("the controlled pending operation must retain its descriptor"),
+    };
+
+    let token = driver.register_cancel(&key);
+    assert!(driver.cancel_token(token));
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 64, 8),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 64, 8))
+        .0
+        .unwrap();
+    let completion = wait_for_controlled_completion(&mut driver, key);
+    completion.0.unwrap();
+    drop(completion.1);
+    let owner_file = match owner.try_unwrap() {
+        Ok(file) => file,
+        Err(_) => panic!("the completed operation released its descriptor"),
+    };
+    drop(owner_file);
+
+    push_and_wait_lock(
+        &mut driver,
+        TryLockFile::exclusive(contender.clone(), 64, 8),
+    )
+    .0
+    .unwrap();
+    push_and_wait_lock(&mut driver, UnlockFile::new(contender.clone(), 64, 8))
+        .0
+        .unwrap();
+}
+
+#[cfg(windows)]
+fn push_and_wait_lock_observing<O: OpCode + 'static>(
+    driver: &mut Proactor,
+    op: O,
+) -> (&'static str, BufResult<usize, O>) {
+    match driver.push(op) {
+        PushEntry::Ready(result) => ("Ready", result),
+        PushEntry::Pending(mut key) => {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let now = std::time::Instant::now();
+                assert!(now < deadline, "lock operation did not complete in time");
+                let timeout = (deadline - now).min(Duration::from_millis(100));
+                match driver.poll(Some(timeout)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+                    Err(error) => panic!("polling lock operation failed: {error}"),
+                }
+                match driver.pop(key) {
+                    PushEntry::Pending(next) => key = next,
+                    PushEntry::Ready(result) => return ("Pending", result),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_controlled_completion(
+    driver: &mut Proactor,
+    mut key: compio_driver::Key<ControlledRangeCompletion>,
+) -> BufResult<usize, ControlledRangeCompletion> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let now = std::time::Instant::now();
+        assert!(
+            now < deadline,
+            "controlled completion packet was not observed"
+        );
+        match driver.poll(Some((deadline - now).min(Duration::from_millis(100)))) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+            Err(error) => panic!("polling controlled completion failed: {error}"),
+        }
+        match driver.pop(key) {
+            PushEntry::Pending(next) => key = next,
+            PushEntry::Ready(result) => return result,
+        }
+    }
+}
+
+#[cfg(windows)]
+enum ControlledRangeOperation {
+    Lock(TryLockFile<SharedFd<std::fs::File>>),
+    Unlock(UnlockFile<SharedFd<std::fs::File>>),
+}
+
+#[cfg(windows)]
+// Tests complete the real syscall first. The synthetic packet then exercises
+// queued retention and cancel-after-success, not native Pending completion.
+struct ControlledRangeCompletion {
+    operation: ControlledRangeOperation,
+    completion_port: compio_driver::RawFd,
+}
+
+#[cfg(windows)]
+impl ControlledRangeCompletion {
+    fn lock(
+        operation: TryLockFile<SharedFd<std::fs::File>>,
+        completion_port: compio_driver::RawFd,
+    ) -> Self {
+        Self {
+            operation: ControlledRangeOperation::Lock(operation),
+            completion_port,
+        }
+    }
+
+    fn unlock(
+        operation: UnlockFile<SharedFd<std::fs::File>>,
+        completion_port: compio_driver::RawFd,
+    ) -> Self {
+        Self {
+            operation: ControlledRangeOperation::Unlock(operation),
+            completion_port,
+        }
+    }
+}
+
+#[cfg(windows)]
+// SAFETY: the driver pins the wrapper and its inner operation until the queued
+// completion is consumed, and the wrapper forwards cancellation to that
+// operation.
+unsafe impl OpCode for ControlledRangeCompletion {
+    type Control = ();
+
+    unsafe fn operate(
+        &mut self,
+        _control: &mut Self::Control,
+        optr: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+    ) -> std::task::Poll<io::Result<usize>> {
+        // SAFETY: the driver pins this wrapper and provides its live OVERLAPPED
+        // storage.
+        let overlapped = unsafe { &mut *optr };
+        overlapped.Internal = 0;
+        overlapped.InternalHigh = 0;
+
+        // SAFETY: this port belongs to the Proactor that supplied optr. No
+        // native I/O is submitted here; the completed operation remains owned
+        // by this wrapper.
+        let posted = unsafe {
+            windows_sys::Win32::System::IO::PostQueuedCompletionStatus(
+                self.completion_port as _,
+                0,
+                0,
+                optr,
+            )
+        };
+        if posted == 0 {
+            std::task::Poll::Ready(Err(io::Error::last_os_error()))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+
+    fn cancel(
+        &mut self,
+        control: &mut Self::Control,
+        optr: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+    ) -> io::Result<()> {
+        match &mut self.operation {
+            ControlledRangeOperation::Lock(op) => OpCode::cancel(op, control, optr),
+            ControlledRangeOperation::Unlock(op) => OpCode::cancel(op, control, optr),
+        }
+    }
+}
+
 fn push_and_wait<O: OpCode + 'static>(driver: &mut Proactor, op: O) -> BufResult<usize, O> {
     match driver.push(op) {
         PushEntry::Ready(res) => res,
