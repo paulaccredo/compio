@@ -65,6 +65,84 @@ impl LockMap {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct SharedLockMap {
+    // The map includes held locks and in-flight reservations.
+    state: std::sync::Arc<std::sync::Mutex<LockMap>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReservationInfo {
+    end: u64,
+    offset: u64,
+    length: u64,
+    exclusive: bool,
+}
+
+#[derive(Debug)]
+struct LockReservation {
+    owner: SharedLockMap,
+    // Dropping this token does not establish that the native operation failed.
+    info: Option<ReservationInfo>,
+}
+
+impl SharedLockMap {
+    fn try_reserve(&self, offset: u64, length: u64, exclusive: bool) -> Option<LockReservation> {
+        let mut state = self.state.lock().expect("lock poisoned");
+        let end = range_end(offset, length)?;
+
+        if !state.try_acquire(offset, length, exclusive) {
+            return None;
+        }
+
+        Some(LockReservation {
+            owner: self.clone(),
+            info: Some(ReservationInfo {
+                end,
+                offset,
+                length,
+                exclusive,
+            }),
+        })
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> LockMap {
+        self.state.lock().expect("lock poisoned").clone()
+    }
+}
+
+impl LockReservation {
+    fn complete(&mut self, succeeded: bool) -> bool {
+        let Some(reservation) = self.info.take() else {
+            return false;
+        };
+
+        let mut state = self.owner.state.lock().expect("lock poisoned");
+        let Some(record) = state.records.get_mut(&reservation.end) else {
+            return false;
+        };
+        if record.offset != reservation.offset || record.length != reservation.length {
+            return false;
+        }
+
+        // Only the native operation's reported outcome may undo its
+        // reservation.
+        if !succeeded {
+            record.count -= 1;
+            if reservation.exclusive {
+                record.exclusive = false;
+            }
+        }
+        let remove = record.count == 0;
+        if remove {
+            state.records.remove(&reservation.end);
+        }
+
+        true
+    }
+}
+
 fn range_end(offset: u64, length: u64) -> Option<u64> {
     if length == 0 {
         None
@@ -391,5 +469,171 @@ mod tests {
         let prior = end_collision.clone();
         assert!(!end_collision.try_acquire(12, 0, true));
         assert_eq!(end_collision, prior);
+    }
+
+    #[test]
+    fn synchronized_owner_and_state_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<SharedLockMap>();
+        assert_send_sync::<LockMap>();
+    }
+
+    #[test]
+    fn owner_clones_share_state_and_keep_it_alive() {
+        let owner = SharedLockMap::default();
+        let clone = owner.clone();
+        let mut reservation = owner.try_reserve(4, 8, true).unwrap();
+        assert!(reservation.complete(true));
+        drop(reservation);
+        drop(owner);
+
+        assert_eq!(clone.snapshot().records[&12].count, 1);
+        assert!(clone.try_reserve(4, 8, true).is_none());
+        let mut other = clone.try_reserve(20, 2, true).unwrap();
+        assert!(other.complete(false));
+    }
+
+    #[test]
+    fn failed_shared_reservation_preserves_held_exclusive_state() {
+        let owner = SharedLockMap::default();
+        let mut exclusive = owner.try_reserve(4, 8, true).unwrap();
+        assert!(exclusive.complete(true));
+        let before = owner.snapshot();
+
+        let mut shared = owner.try_reserve(4, 8, false).unwrap();
+        assert_eq!(owner.snapshot().records[&12].count, 2);
+        assert!(shared.complete(false));
+        assert_eq!(owner.snapshot(), before);
+        assert!(owner.try_reserve(4, 8, true).is_none());
+    }
+
+    #[test]
+    fn failed_new_reservation_removes_only_its_range_and_can_be_retried() {
+        let owner = SharedLockMap::default();
+        let mut held = owner.try_reserve(4, 8, true).unwrap();
+        assert!(held.complete(true));
+        let mut failed = owner.try_reserve(20, 4, true).unwrap();
+
+        assert!(failed.complete(false));
+        let map = owner.snapshot();
+        assert_eq!(map.records.len(), 1);
+        assert!(map.records.contains_key(&12));
+        assert!(!map.records.contains_key(&24));
+
+        let mut retry = owner.try_reserve(20, 4, true).unwrap();
+        assert!(retry.complete(true));
+        assert_eq!(owner.snapshot().records.len(), 2);
+    }
+
+    #[test]
+    fn out_of_order_reservation_completions_preserve_successful_modes() {
+        for exclusive_succeeded in [false, true] {
+            for shared_succeeded in [false, true] {
+                for shared_completes_first in [false, true] {
+                    let owner = SharedLockMap::default();
+                    let mut exclusive = owner.try_reserve(4, 8, true).unwrap();
+                    let mut shared = owner.try_reserve(4, 8, false).unwrap();
+
+                    if shared_completes_first {
+                        assert!(shared.complete(shared_succeeded));
+                        assert!(exclusive.complete(exclusive_succeeded));
+                    } else {
+                        assert!(exclusive.complete(exclusive_succeeded));
+                        assert!(shared.complete(shared_succeeded));
+                    }
+
+                    let map = owner.snapshot();
+                    match (exclusive_succeeded, shared_succeeded) {
+                        (false, false) => assert!(map.records.is_empty()),
+                        (true, false) => {
+                            let record = &map.records[&12];
+                            assert_eq!(record.count, 1);
+                            assert!(record.exclusive);
+                        }
+                        (false, true) => {
+                            let record = &map.records[&12];
+                            assert_eq!(record.count, 1);
+                            assert!(!record.exclusive);
+                        }
+                        (true, true) => {
+                            let record = &map.records[&12];
+                            assert_eq!(record.count, 2);
+                            assert!(record.exclusive);
+                        }
+                    }
+
+                    let completed = owner.snapshot();
+                    assert!(!exclusive.complete(!exclusive_succeeded));
+                    assert!(!shared.complete(!shared_succeeded));
+                    assert_eq!(owner.snapshot(), completed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_incomplete_reservation_keeps_range_conservatively_reserved() {
+        let owner = SharedLockMap::default();
+        let reservation = owner.try_reserve(4, 8, true).unwrap();
+        let before = owner.snapshot();
+
+        drop(reservation);
+
+        assert_eq!(owner.snapshot(), before);
+        assert!(owner.try_reserve(5, 4, false).is_none());
+        assert!(owner.try_reserve(4, 8, true).is_none());
+    }
+
+    #[test]
+    fn reservation_completion_is_applied_once() {
+        let owner = SharedLockMap::default();
+        let mut reservation = owner.try_reserve(4, 8, false).unwrap();
+
+        assert!(reservation.complete(false));
+        assert!(!reservation.complete(true));
+        assert!(owner.snapshot().records.is_empty());
+
+        let mut reservation = owner.try_reserve(20, 4, true).unwrap();
+        assert!(reservation.complete(true));
+        let before = owner.snapshot();
+        assert!(!reservation.complete(false));
+        assert_eq!(owner.snapshot(), before);
+    }
+
+    #[test]
+    fn competing_exclusive_reservations_are_atomic_across_clones() {
+        let owner = SharedLockMap::default();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        let mut threads = Vec::new();
+        for clone in [owner.clone(), owner.clone()] {
+            let barrier = barrier.clone();
+            let sender = sender.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                let reservation = clone.try_reserve(4, 8, true);
+                sender.send(reservation).unwrap();
+            }));
+        }
+        drop(sender);
+        barrier.wait();
+
+        let reservations = [
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+        ];
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(reservations.iter().filter(|item| item.is_some()).count(), 1);
+        let mut reservation = reservations.into_iter().flatten().next().unwrap();
+        assert!(reservation.complete(false));
+        assert!(owner.snapshot().records.is_empty());
     }
 }
