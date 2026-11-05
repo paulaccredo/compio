@@ -46,6 +46,7 @@ impl LockMap {
         }
     }
 
+    #[cfg(test)]
     fn release(&mut self, offset: u64, length: u64) -> bool {
         let Some(end) = range_end(offset, length) else {
             return false;
@@ -66,7 +67,7 @@ impl LockMap {
 }
 
 #[derive(Clone, Debug, Default)]
-struct SharedLockMap {
+pub(super) struct SharedLockMap {
     // The map includes held locks and in-flight reservations.
     state: std::sync::Arc<std::sync::Mutex<LockMap>>,
 }
@@ -80,14 +81,19 @@ struct ReservationInfo {
 }
 
 #[derive(Debug)]
-struct LockReservation {
+pub(super) struct LockReservation {
     owner: SharedLockMap,
     // Dropping this token does not establish that the native operation failed.
     info: Option<ReservationInfo>,
 }
 
 impl SharedLockMap {
-    fn try_reserve(&self, offset: u64, length: u64, exclusive: bool) -> Option<LockReservation> {
+    pub(super) fn try_reserve(
+        &self,
+        offset: u64,
+        length: u64,
+        exclusive: bool,
+    ) -> Option<LockReservation> {
         let mut state = self.state.lock().expect("lock poisoned");
         let end = range_end(offset, length)?;
 
@@ -110,10 +116,20 @@ impl SharedLockMap {
     fn snapshot(&self) -> LockMap {
         self.state.lock().expect("lock poisoned").clone()
     }
+
+    #[cfg(test)]
+    pub(super) fn count_at(&self, end: u64) -> Option<usize> {
+        self.state
+            .lock()
+            .expect("lock poisoned")
+            .records
+            .get(&end)
+            .map(|record| record.count)
+    }
 }
 
 impl LockReservation {
-    fn complete(&mut self, succeeded: bool) -> bool {
+    pub(super) fn complete(&mut self, succeeded: bool) -> bool {
         let Some(reservation) = self.info.take() else {
             return false;
         };
@@ -173,6 +189,7 @@ impl LockRecord {
         true
     }
 
+    #[cfg(test)]
     fn release(&mut self) -> bool {
         if self.count == 0 {
             return false;

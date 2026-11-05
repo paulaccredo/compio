@@ -19,7 +19,7 @@
 mod file;
 pub use file::*;
 
-#[cfg(all(windows, test))]
+#[cfg(windows)]
 mod locks;
 
 mod open_options;

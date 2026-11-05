@@ -251,6 +251,208 @@ async fn hidden_file_truncation() {
     assert_eq!(metadata.len(), 0);
 }
 
+#[cfg(windows)]
+#[compio_macros::test]
+async fn file_locks_conflict_across_independent_handles() {
+    let tempfile = tempfile();
+    let first = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let second = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let third = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+
+    first.try_lock_shared(12, 8).await.unwrap();
+    second.try_lock_shared(12, 8).await.unwrap();
+    let error = third.try_lock_exclusive(12, 8).await.unwrap_err();
+    assert_eq!(
+        error.raw_os_error(),
+        Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+    );
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
+async fn file_clones_share_lock_state_and_failed_acquire_keeps_it() {
+    let tempfile = tempfile();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let clone = file.clone();
+
+    file.try_lock_exclusive(20, 4).await.unwrap();
+    clone.try_lock_shared(20, 4).await.unwrap();
+    let error = clone.try_lock_exclusive(20, 4).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(error.raw_os_error(), None);
+    let error = file.try_lock_exclusive(20, 4).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(error.raw_os_error(), None);
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
+async fn native_acquire_failure_can_retry_without_losing_sibling_lock() {
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+
+    let tempfile = tempfile();
+    let target = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let foreign_first = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let foreign_second = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let fresh = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+
+    target.try_lock_exclusive(72, 4).await.unwrap();
+    foreign_first.try_lock_shared(88, 4).await.unwrap();
+    foreign_second.try_lock_shared(88, 4).await.unwrap();
+
+    let error = target.try_lock_exclusive(88, 4).await.unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as i32));
+
+    drop(foreign_second);
+    drop(foreign_first);
+    target.try_lock_exclusive(88, 4).await.unwrap();
+
+    let error = target.try_lock_exclusive(72, 4).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(error.raw_os_error(), None);
+    let error = fresh.try_lock_shared(72, 4).await.unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as i32));
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
+async fn dropping_unpolled_lock_future_does_not_reserve_range() {
+    let tempfile = tempfile();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+
+    drop(file.try_lock_exclusive(32, 4));
+    file.try_lock_exclusive(32, 4).await.unwrap();
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
+async fn completed_lock_future_drop_keeps_native_lock_held() {
+    let tempfile = tempfile();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+    };
+
+    let mut acquisition = Box::pin(file.try_lock_exclusive(40, 4));
+    poll_fn(|cx| match acquisition.as_mut().poll(cx) {
+        Poll::Ready(result) => {
+            assert!(result.is_ok());
+            Poll::Ready(())
+        }
+        Poll::Pending => Poll::Pending,
+    })
+    .await;
+    drop(acquisition);
+
+    assert!(contender.try_lock_shared(40, 4).await.is_err());
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
+async fn invalid_lock_ranges_are_rejected_without_reserving_state() {
+    let tempfile = tempfile();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        file.try_lock_shared(0, 0).await.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        file.try_lock_exclusive(u64::MAX, 1)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    file.try_lock_exclusive(0, 4).await.unwrap();
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
+async fn file_io_works_while_a_range_lock_is_held() {
+    let tempfile = tempfile();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    file.try_lock_exclusive(0, HELLO.len() as u64)
+        .await
+        .unwrap();
+    file.write_all_at(HELLO, 0).await.0.unwrap();
+    let (length, buffer) = file
+        .read_to_end_at(Vec::with_capacity(HELLO.len()), 0)
+        .await
+        .unwrap();
+
+    assert_eq!(length, HELLO.len());
+    assert_eq!(buffer, HELLO);
+}
+
 fn tempfile() -> NamedTempFile {
     NamedTempFile::new().unwrap()
 }
