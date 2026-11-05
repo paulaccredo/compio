@@ -21,6 +21,64 @@ cfg_select! {
 
 use crate::sys::prelude::*;
 
+/// Try to acquire a Windows byte-range lock without waiting for conflicts.
+///
+/// `offset` is the first byte and `len` is the exact number of bytes locked.
+/// The operation retains `fd` until completion. A successful lock remains
+/// held until an exact-range [`UnlockFile`] operation succeeds or the handle
+/// closes. Dropping the completed operation does not issue an unlock while
+/// the handle remains open.
+#[cfg(windows)]
+pub struct TryLockFile<S> {
+    pub(crate) fd: S,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+    pub(crate) exclusive: bool,
+}
+
+#[cfg(windows)]
+impl<S> TryLockFile<S> {
+    /// Create a shared byte-range lock operation.
+    pub fn shared(fd: S, offset: u64, len: u64) -> Self {
+        Self {
+            fd,
+            offset,
+            len,
+            exclusive: false,
+        }
+    }
+
+    /// Create an exclusive byte-range lock operation.
+    pub fn exclusive(fd: S, offset: u64, len: u64) -> Self {
+        Self {
+            fd,
+            offset,
+            len,
+            exclusive: true,
+        }
+    }
+}
+
+/// Release an exact Windows byte range locked through the same file handle.
+///
+/// `offset` is the first byte and `len` is the exact number of bytes unlocked.
+/// The operation retains `fd` until completion. Dropping a completed unlock
+/// operation has no further effect.
+#[cfg(windows)]
+pub struct UnlockFile<S> {
+    pub(crate) fd: S,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+}
+
+#[cfg(windows)]
+impl<S> UnlockFile<S> {
+    /// Create a byte-range unlock operation.
+    pub fn new(fd: S, offset: u64, len: u64) -> Self {
+        Self { fd, offset, len }
+    }
+}
+
 /// Close the file fd.
 pub struct CloseFile {
     pub(crate) fd: ManuallyDrop<OwnedFd>,
