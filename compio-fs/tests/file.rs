@@ -425,6 +425,294 @@ async fn unlock_requires_an_exact_held_range_and_preserves_native_errors() {
 
 #[cfg(windows)]
 #[compio_macros::test]
+async fn cloned_std_file_can_unlock_ranges_acquired_by_file_handle() {
+    use std::os::windows::io::AsHandle;
+
+    use compio_driver::op::UnlockFile;
+    use compio_runtime::Runtime;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+
+    let tempfile = tempfile();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+
+    let std_file = std::fs::File::from(file.as_handle().try_clone_to_owned().unwrap());
+    let duplicate = std_file.try_clone().unwrap();
+    drop(std_file);
+
+    let offset = 0x1_0000_0010;
+    file.try_lock_exclusive(offset, 4).await.unwrap();
+    file.try_lock_shared(offset, 4).await.unwrap();
+    file.try_lock_shared(offset, 4).await.unwrap();
+
+    for expected_remaining in [2, 1] {
+        let unlock = Runtime::with_current(|runtime| {
+            runtime.submit(UnlockFile::new(duplicate.try_clone().unwrap(), offset, 4))
+        });
+        unlock.await.0.unwrap();
+
+        let error = contender.try_lock_exclusive(offset, 4).await.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as i32));
+
+        if expected_remaining == 2 {
+            contender.try_lock_shared(offset, 4).await.unwrap();
+            contender.unlock(offset, 4).await.unwrap();
+        }
+    }
+
+    let unlock = Runtime::with_current(|runtime| {
+        runtime.submit(UnlockFile::new(duplicate.try_clone().unwrap(), offset, 4))
+    });
+    unlock.await.0.unwrap();
+
+    contender.try_lock_exclusive(offset, 4).await.unwrap();
+    contender.unlock(offset, 4).await.unwrap();
+    // Keep both handles open through the contender's successful acquisition.
+    drop(duplicate);
+    drop(file);
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
+async fn final_file_owner_releases_every_count_and_range() {
+    use compio_driver::ToSharedFd;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+
+    let tempfile = tempfile();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let clone = file.clone();
+    let keepalive = file.to_shared_fd();
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+
+    file.try_lock_shared(200, 4).await.unwrap();
+    file.try_lock_shared(200, 4).await.unwrap();
+    file.try_lock_exclusive(220, 4).await.unwrap();
+    drop(clone);
+
+    let error = contender.try_lock_exclusive(200, 4).await.unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as i32));
+    let error = contender.try_lock_shared(220, 4).await.unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as i32));
+
+    drop(file);
+    acquire_exclusive_after_cleanup(&contender, 200, 4).await;
+    contender.unlock(200, 4).await.unwrap();
+    acquire_exclusive_after_cleanup(&contender, 220, 4).await;
+    contender.unlock(220, 4).await.unwrap();
+
+    // Keep the original OS handle open to prove cleanup released both ranges.
+    drop(keepalive);
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
+async fn final_owner_cleanup_splits_high_offset_and_length() {
+    use compio_driver::ToSharedFd;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+
+    let tempfile = tempfile();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let keepalive = file.to_shared_fd();
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let offset = 0x1_0000_0010;
+    let length = 0x1_0000_0004;
+
+    file.try_lock_exclusive(offset, length).await.unwrap();
+    let error = contender
+        .try_lock_exclusive(offset, length)
+        .await
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as i32));
+
+    drop(file);
+    acquire_exclusive_after_cleanup(&contender, offset, length).await;
+    contender.unlock(offset, length).await.unwrap();
+
+    // Keep the original OS handle open so only cleanup can release the range.
+    drop(keepalive);
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
+async fn cleanup_failure_does_not_prevent_later_range_release() {
+    use compio_driver::{ToSharedFd, op::UnlockFile};
+    use compio_runtime::Runtime;
+
+    let tempfile = tempfile();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let keepalive = file.to_shared_fd();
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+
+    file.try_lock_exclusive(240, 4).await.unwrap();
+    file.try_lock_exclusive(260, 4).await.unwrap();
+
+    let native_unlock = Runtime::with_current(|runtime| {
+        runtime.submit(UnlockFile::new(file.to_shared_fd(), 240, 4))
+    });
+    native_unlock.await.0.unwrap();
+
+    // Range 240 is now stale in File's private map, so its cleanup attempt
+    // returns ERROR_NOT_LOCKED before cleanup reaches range 260.
+    drop(file);
+    acquire_exclusive_after_cleanup(&contender, 260, 4).await;
+    contender.unlock(260, 4).await.unwrap();
+    contender.try_lock_exclusive(240, 4).await.unwrap();
+    contender.unlock(240, 4).await.unwrap();
+    drop(keepalive);
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
+async fn closing_native_handle_releases_locks_without_file_owner_records() {
+    use compio_driver::{ToSharedFd, op::TryLockFile};
+    use compio_runtime::Runtime;
+
+    let tempfile = tempfile();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tempfile.path())
+        .await
+        .unwrap();
+
+    let native_lock = Runtime::with_current(|runtime| {
+        runtime.submit(TryLockFile::exclusive(file.to_shared_fd(), 280, 4))
+    });
+    native_lock.await.0.unwrap();
+    assert!(contender.try_lock_exclusive(280, 4).await.is_err());
+
+    drop(file);
+    contender.try_lock_exclusive(280, 4).await.unwrap();
+    contender.unlock(280, 4).await.unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn final_owner_cleanup_runs_without_an_entered_runtime() {
+    use compio_driver::ToSharedFd;
+    use compio_runtime::Runtime;
+
+    let tempfile = tempfile();
+    let path = tempfile.path().to_path_buf();
+    let runtime = Runtime::new().unwrap();
+    let (file, keepalive) = runtime.block_on(async {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.try_lock_exclusive(300, 4).await.unwrap();
+        let keepalive = file.to_shared_fd();
+        (file, keepalive)
+    });
+    drop(runtime);
+    drop(file);
+
+    let runtime = Runtime::new().unwrap();
+    runtime.block_on(async {
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        acquire_exclusive_after_cleanup(&contender, 300, 4).await;
+        contender.unlock(300, 4).await.unwrap();
+    });
+    drop(keepalive);
+}
+
+#[cfg(windows)]
+#[test]
+fn final_owner_cleanup_runs_while_runtime_clears_tasks() {
+    use compio_driver::ToSharedFd;
+    use compio_runtime::Runtime;
+
+    let tempfile = tempfile();
+    let path = tempfile.path().to_path_buf();
+    let runtime = Runtime::new().unwrap();
+    let keepalive = runtime.block_on(async {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.try_lock_exclusive(320, 4).await.unwrap();
+        let keepalive = file.to_shared_fd();
+        runtime
+            .spawn(async move {
+                let _file = file;
+                std::future::pending::<()>().await;
+            })
+            .detach();
+        keepalive
+    });
+
+    drop(runtime);
+    let runtime = Runtime::new().unwrap();
+    runtime.block_on(async {
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        acquire_exclusive_after_cleanup(&contender, 320, 4).await;
+        contender.unlock(320, 4).await.unwrap();
+    });
+    drop(keepalive);
+}
+
+#[cfg(windows)]
+#[compio_macros::test]
 async fn dropping_unpolled_unlock_future_keeps_native_and_recorded_lock() {
     let tempfile = tempfile();
     let file = OpenOptions::new()
@@ -603,6 +891,29 @@ async fn file_io_works_while_a_range_lock_is_held() {
 
     assert_eq!(length, HELLO.len());
     assert_eq!(buffer, HELLO);
+}
+
+#[cfg(windows)]
+async fn acquire_exclusive_after_cleanup(file: &File, offset: u64, length: u64) {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match file.try_lock_exclusive(offset, length).await {
+            Ok(()) => return,
+            Err(error)
+                if error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32) =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "cleanup did not release the range"
+                );
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("unexpected error while observing cleanup: {error:?}"),
+        }
+    }
 }
 
 fn tempfile() -> NamedTempFile {

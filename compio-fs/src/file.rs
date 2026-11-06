@@ -124,6 +124,11 @@ impl File {
             ));
         }
         let submit = Runtime::with_current(|runtime| {
+            self.locks.ensure_cleanup_file(|| {
+                self.as_handle()
+                    .try_clone_to_owned()
+                    .map(std::fs::File::from)
+            })?;
             let Some(reservation) = self.locks.try_reserve(offset, length, exclusive) else {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -632,6 +637,80 @@ mod tests {
     use compio_driver::AsRawFd;
 
     use super::*;
+
+    async fn acquire_exclusive_after_cleanup(file: &File, offset: u64, length: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match file.try_lock_exclusive(offset, length).await {
+                Ok(()) => return,
+                Err(error)
+                    if error.raw_os_error()
+                        == Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32) =>
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "cleanup did not release the range"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("unexpected error while observing cleanup: {error:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn reservation_keeps_cleanup_owner_alive_across_runtime_teardown() {
+        let tempfile = tempfile::NamedTempFile::new().unwrap();
+        let path = tempfile.path().to_path_buf();
+        let runtime = Runtime::new().unwrap();
+        let (file, mut reservation, keepalive) = runtime.block_on(async {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .await
+                .unwrap();
+            file.try_lock_shared(80, 4).await.unwrap();
+            let reservation = file
+                .locks
+                .try_reserve(80, 4, false)
+                .expect("controlled reservation should share the held range");
+            runtime
+                .submit(TryLockFile::shared(file.to_shared_fd(), 80, 4))
+                .await
+                .0
+                .unwrap();
+            let keepalive = file.to_shared_fd();
+            (file, reservation, keepalive)
+        });
+
+        drop(file);
+        drop(runtime);
+
+        let runtime = Runtime::new().unwrap();
+        let contender = runtime.block_on(async {
+            let contender = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .await
+                .unwrap();
+            let error = contender.try_lock_exclusive(80, 4).await.unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+            );
+            contender
+        });
+
+        assert!(reservation.complete(true));
+        drop(reservation);
+        runtime.block_on(async {
+            acquire_exclusive_after_cleanup(&contender, 80, 4).await;
+            contender.unlock(80, 4).await.unwrap();
+        });
+        drop(keepalive);
+    }
 
     #[compio_macros::test]
     async fn completion_callback_records_lock_before_operation_drop() {

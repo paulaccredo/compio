@@ -1,4 +1,19 @@
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    io,
+};
+
+use windows_sys::Win32::{
+    Foundation::{ERROR_IO_PENDING, GetLastError},
+    Storage::FileSystem::UnlockFileEx,
+    System::{
+        IO::OVERLAPPED,
+        Threading::{
+            CloseThreadpoolWait, CreateEventW, CreateThreadpoolWait, PTP_CALLBACK_INSTANCE,
+            PTP_WAIT, SetThreadpoolWait,
+        },
+    },
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LockRecord {
@@ -71,7 +86,169 @@ impl LockMap {
 #[derive(Clone, Debug, Default)]
 pub(super) struct SharedLockMap {
     // The map includes held locks and in-flight reservations.
-    state: std::sync::Arc<std::sync::Mutex<LockMap>>,
+    state: std::sync::Arc<std::sync::Mutex<LockState>>,
+}
+
+#[derive(Debug, Default)]
+struct LockState {
+    map: LockMap,
+    // WHY: Drop needs an owned handle independent of SharedFd and a runtime.
+    cleanup_file: Option<std::fs::File>,
+    #[cfg(test)]
+    _drop_signal: Option<DropSignal>,
+}
+
+impl Drop for LockState {
+    fn drop(&mut self) {
+        let Some(file) = self.cleanup_file.take() else {
+            return;
+        };
+
+        clear_locks(&self.map, |offset, length| {
+            let cleanup_file = file.try_clone()?;
+            unlock_best_effort(cleanup_file, offset, length)
+        });
+    }
+}
+
+fn clear_locks(map: &LockMap, mut unlock: impl FnMut(u64, u64) -> io::Result<()>) {
+    for record in map.records.values() {
+        for _ in 0..record.count {
+            // WHY: Drop cannot return native errors; handle closure releases
+            // any range that best-effort unlock could not release.
+            let _ = unlock(record.offset, record.length);
+        }
+    }
+}
+
+struct PendingUnlock {
+    file: std::fs::File,
+    _event: std::os::windows::io::OwnedHandle,
+    overlapped: OVERLAPPED,
+    #[cfg(test)]
+    _drop_signal: Option<DropSignal>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct DropSignal(std::sync::mpsc::Sender<()>);
+
+#[cfg(test)]
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+fn unlock_best_effort(file: std::fs::File, offset: u64, length: u64) -> io::Result<()> {
+    let operation = prepare_unlock(file, offset)?;
+    submit_unlock(operation, |handle, overlapped| {
+        // SAFETY: the request owns the duplicated handle and heap OVERLAPPED
+        // through immediate completion or the registered event callback.
+        let result =
+            unsafe { UnlockFileEx(handle, 0, length as u32, (length >> 32) as u32, overlapped) };
+        if result != 0 {
+            Ok(())
+        } else {
+            // SAFETY: GetLastError has no pointer or handle preconditions.
+            let error = unsafe { GetLastError() };
+            Err(io::Error::from_raw_os_error(error as i32))
+        }
+    })
+}
+
+fn prepare_unlock(file: std::fs::File, offset: u64) -> io::Result<Box<PendingUnlock>> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+
+    // SAFETY: null attributes/name request a new unnamed manual-reset event.
+    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if event.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: CreateEventW returned a new owned event handle.
+    let event = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(event) };
+    let event_handle = event.as_raw_handle();
+    let mut operation = Box::new(PendingUnlock {
+        file,
+        _event: event,
+        overlapped: OVERLAPPED::default(),
+        #[cfg(test)]
+        _drop_signal: None,
+    });
+    operation.overlapped.Anonymous.Anonymous.Offset = offset as u32;
+    operation.overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+    // WHY: the low bit suppresses a completion packet for this non-driver
+    // OVERLAPPED while the event still reports completion to the thread pool.
+    operation.overlapped.hEvent = (event_handle as usize | 1) as _;
+
+    Ok(operation)
+}
+
+fn submit_unlock(
+    operation: Box<PendingUnlock>,
+    issue: impl FnOnce(std::os::windows::io::RawHandle, *mut OVERLAPPED) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    let context = Box::into_raw(operation);
+    // SAFETY: the raw pointer owns the request until it is reconstructed
+    // below or by the callback. The wait is unarmed until native Pending.
+    let wait =
+        unsafe { CreateThreadpoolWait(Some(unlock_complete), context.cast(), std::ptr::null()) };
+    if wait == 0 {
+        let error = io::Error::last_os_error();
+        // SAFETY: wait allocation failed, so no callback can use the context.
+        drop(unsafe { Box::from_raw(context) });
+        return Err(error);
+    }
+
+    // SAFETY: the wait is unarmed, and this function still owns the request.
+    let event_handle = unsafe { (*context)._event.as_raw_handle() };
+    // SAFETY: the wait is unarmed, and the request remains alive here.
+    let handle = unsafe { (*context).file.as_raw_handle() };
+    // SAFETY: the wait is unarmed, and the request remains alive here.
+    let overlapped = unsafe { std::ptr::addr_of_mut!((*context).overlapped) };
+    let result = issue(handle, overlapped);
+    match result {
+        Ok(()) => {
+            // SAFETY: this wait was never armed, so no callback can run.
+            unsafe { CloseThreadpoolWait(wait) };
+            // SAFETY: the wait is closed without arming, so no callback can
+            // use the request context.
+            drop(unsafe { Box::from_raw(context) });
+            Ok(())
+        }
+        Err(error) if error.raw_os_error() == Some(ERROR_IO_PENDING as i32) => {
+            // SAFETY: the callback now owns context; the manual-reset event
+            // retains a signal that arrives before the wait is armed.
+            unsafe { SetThreadpoolWait(wait, event_handle, std::ptr::null()) };
+            Ok(())
+        }
+        Err(error) => {
+            // SAFETY: this wait was never armed, so no callback can run.
+            unsafe { CloseThreadpoolWait(wait) };
+            // SAFETY: the wait is closed without arming, so no callback can
+            // use the request context.
+            drop(unsafe { Box::from_raw(context) });
+            Err(error)
+        }
+    }
+}
+
+unsafe extern "system" fn unlock_complete(
+    _instance: PTP_CALLBACK_INSTANCE,
+    context: *mut std::ffi::c_void,
+    wait: PTP_WAIT,
+    _wait_result: u32,
+) {
+    // SAFETY: the callback runs once after the event is signaled; closing the
+    // wait is asynchronous if this callback is still active.
+    unsafe { CloseThreadpoolWait(wait) };
+    // SAFETY: the pending branch transferred this Box to the callback before
+    // arming the one-shot wait, and no other path reclaims it.
+    let operation = unsafe { Box::from_raw(context.cast::<PendingUnlock>()) };
+    drop(operation);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -99,16 +276,17 @@ impl SharedLockMap {
         let mut state = self.state.lock().expect("lock poisoned");
         let end = range_end(offset, length)?;
 
-        if state.records.get(&end).is_some_and(|record| {
+        if state.map.records.get(&end).is_some_and(|record| {
             record.offset == offset && record.length == length && record.release_pending
         }) {
             return None;
         }
 
-        if !state.try_acquire(offset, length, exclusive) {
+        if !state.map.try_acquire(offset, length, exclusive) {
             return None;
         }
         state
+            .map
             .records
             .get_mut(&end)
             .expect("successful acquisition reservation has a record")
@@ -125,6 +303,17 @@ impl SharedLockMap {
         })
     }
 
+    pub(super) fn ensure_cleanup_file(
+        &self,
+        make_file: impl FnOnce() -> io::Result<std::fs::File>,
+    ) -> io::Result<()> {
+        let mut state = self.state.lock().expect("lock poisoned");
+        if state.cleanup_file.is_none() {
+            state.cleanup_file = Some(make_file()?);
+        }
+        Ok(())
+    }
+
     pub(super) fn try_reserve_release(
         &self,
         offset: u64,
@@ -132,7 +321,7 @@ impl SharedLockMap {
     ) -> Option<LockReleaseReservation> {
         let end = range_end(offset, length)?;
         let mut state = self.state.lock().expect("lock poisoned");
-        let record = state.records.get_mut(&end)?;
+        let record = state.map.records.get_mut(&end)?;
         if record.offset != offset
             || record.length != length
             || record.pending_acquisitions != 0
@@ -156,7 +345,7 @@ impl SharedLockMap {
 
     #[cfg(test)]
     fn snapshot(&self) -> LockMap {
-        self.state.lock().expect("lock poisoned").clone()
+        self.state.lock().expect("lock poisoned").map.clone()
     }
 
     #[cfg(test)]
@@ -164,6 +353,7 @@ impl SharedLockMap {
         self.state
             .lock()
             .expect("lock poisoned")
+            .map
             .records
             .get(&end)
             .map(|record| record.count)
@@ -174,6 +364,7 @@ impl SharedLockMap {
         self.state
             .lock()
             .expect("lock poisoned")
+            .map
             .records
             .get(&end)
             .map(|record| {
@@ -194,7 +385,7 @@ impl LockReservation {
         };
 
         let mut state = self.owner.state.lock().expect("lock poisoned");
-        let Some(record) = state.records.get_mut(&reservation.end) else {
+        let Some(record) = state.map.records.get_mut(&reservation.end) else {
             return false;
         };
         if record.offset != reservation.offset || record.length != reservation.length {
@@ -212,7 +403,7 @@ impl LockReservation {
         }
         let remove = record.count == 0;
         if remove {
-            state.records.remove(&reservation.end);
+            state.map.records.remove(&reservation.end);
         }
 
         true
@@ -232,7 +423,7 @@ impl LockReleaseReservation {
         };
 
         let mut state = self.owner.state.lock().expect("lock poisoned");
-        let Some(record) = state.records.get_mut(&reservation.end) else {
+        let Some(record) = state.map.records.get_mut(&reservation.end) else {
             return false;
         };
         if record.offset != reservation.offset || record.length != reservation.length {
@@ -241,7 +432,7 @@ impl LockReleaseReservation {
 
         record.finish_release(succeeded);
         if record.count == 0 {
-            state.records.remove(&reservation.end);
+            state.map.records.remove(&reservation.end);
         }
         true
     }
@@ -310,6 +501,130 @@ impl LockRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_continues_after_an_unlock_error_for_every_held_count() {
+        let mut map = LockMap::default();
+        assert!(map.try_acquire(5, 4, true));
+        assert!(map.try_acquire(5, 4, false));
+        assert!(map.try_acquire(20, 2, false));
+
+        let mut attempts = Vec::new();
+        clear_locks(&map, |offset, length| {
+            attempts.push((offset, length));
+            if attempts.len() == 1 {
+                Err(io::Error::other("controlled cleanup failure"))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(attempts, [(5, 4), (5, 4), (20, 2)]);
+    }
+
+    #[test]
+    fn reservation_keeps_cleanup_owner_alive_until_completion() {
+        use std::sync::mpsc;
+
+        let tempfile = tempfile::NamedTempFile::new().unwrap();
+        let owner = SharedLockMap::default();
+        owner
+            .ensure_cleanup_file(|| std::fs::File::open(tempfile.path()))
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        owner.state.lock().unwrap()._drop_signal = Some(DropSignal(sender));
+        let mut reservation = owner.try_reserve(16, 4, true).unwrap();
+
+        drop(owner);
+        assert_eq!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(reservation.complete(true));
+        drop(reservation);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("last reservation drop should release the shared cleanup owner");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn controlled_pending_unlock_retains_storage_until_event_completion() {
+        use std::{sync::mpsc, time::Duration};
+
+        use windows_sys::Win32::{
+            Foundation::{GetHandleInformation, HANDLE},
+            System::Threading::SetEvent,
+        };
+
+        let tempfile = tempfile::NamedTempFile::new().unwrap();
+        let file = std::fs::File::open(tempfile.path()).unwrap();
+        let mut operation = prepare_unlock(file, 0).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        operation._drop_signal = Some(DropSignal(sender));
+
+        let mut event = None;
+        let mut file_handle = None;
+        submit_unlock(operation, |handle, overlapped| {
+            file_handle = Some(handle);
+            // SAFETY: the test control reads the request-owned OVERLAPPED
+            // before reporting synthetic Pending; it does not retain it.
+            let event_handle: HANDLE = unsafe { (*overlapped).hEvent };
+            assert_eq!(event_handle as usize & 1, 1);
+            event = Some((event_handle as usize & !1) as HANDLE);
+            Err(io::Error::from_raw_os_error(ERROR_IO_PENDING as i32))
+        })
+        .unwrap();
+
+        let event = event.expect("test control captured the completion event");
+        let file_handle = file_handle.expect("test control captured the file handle");
+        let mut flags = 0;
+        // SAFETY: the callback has not run, so the request still owns the
+        // event.
+        assert_ne!(unsafe { GetHandleInformation(event, &mut flags) }, 0);
+        assert_eq!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty));
+        // SAFETY: the queued request owns this duplicated file handle until
+        // the test signals its event and observes the callback's drop signal.
+        assert_ne!(unsafe { GetHandleInformation(file_handle, &mut flags) }, 0);
+        // SAFETY: the pending request retains this live manual-reset event.
+        assert_ne!(unsafe { SetEvent(event) }, 0);
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("completion callback should release pending request storage");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn controlled_pending_unlock_observes_event_signaled_before_wait_arm() {
+        use std::{sync::mpsc, time::Duration};
+
+        use windows_sys::Win32::{
+            Foundation::{GetHandleInformation, HANDLE},
+            System::Threading::SetEvent,
+        };
+
+        let tempfile = tempfile::NamedTempFile::new().unwrap();
+        let file = std::fs::File::open(tempfile.path()).unwrap();
+        let mut operation = prepare_unlock(file, 0).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        operation._drop_signal = Some(DropSignal(sender));
+
+        submit_unlock(operation, |_handle, overlapped| {
+            // SAFETY: the test signals the request-owned event before it
+            // reports synthetic Pending; wait registration happens later.
+            let raw_event: HANDLE = unsafe { (*overlapped).hEvent };
+            assert_eq!(raw_event as usize & 1, 1);
+            let event = (raw_event as usize & !1) as HANDLE;
+            let mut flags = 0;
+            // SAFETY: the pending request owns this event.
+            assert_ne!(unsafe { GetHandleInformation(event, &mut flags) }, 0);
+            // SAFETY: the event is owned by the pending request.
+            assert_ne!(unsafe { SetEvent(event) }, 0);
+            Err(io::Error::from_raw_os_error(ERROR_IO_PENDING as i32))
+        })
+        .unwrap();
+
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the wait should observe an event signaled before it was armed");
+    }
 
     #[test]
     fn new_record_tracks_one_shared_acquisition() {
