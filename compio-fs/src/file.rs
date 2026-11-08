@@ -803,12 +803,22 @@ mod tests {
             .open(tempfile.path())
             .await
             .unwrap();
+        let BufResult(result, native_op) = Runtime::with_current(|runtime| {
+            runtime.submit(TryLockFile::exclusive(file.to_shared_fd(), 56, 4))
+        })
+        .await;
+        result.unwrap();
+        let error = contender.try_lock_shared(56, 4).await.unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+        );
         let reservation = file.locks.try_reserve(56, 4, true).unwrap();
         let queued = Rc::new(Cell::new(false));
         let completed = Rc::new(Cell::new(false));
         let op = ControlledTryLockCompletion {
             inner: TryLockFileOp {
-                inner: TryLockFile::exclusive(file.to_shared_fd(), 56, 4),
+                inner: native_op,
                 reservation: Some(reservation),
             },
             completion_port: Runtime::with_current(|runtime| runtime.as_raw_fd()),
@@ -865,12 +875,22 @@ mod tests {
             .open(tempfile.path())
             .await
             .unwrap();
+        let BufResult(result, native_op) = Runtime::with_current(|runtime| {
+            runtime.submit(TryLockFile::exclusive(file.to_shared_fd(), 60, 4))
+        })
+        .await;
+        result.unwrap();
+        let error = contender.try_lock_shared(60, 4).await.unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+        );
         let reservation = file.locks.try_reserve(60, 4, true).unwrap();
         let queued = Rc::new(Cell::new(false));
         let completed = Rc::new(Cell::new(false));
         let op = ControlledTryLockCompletion {
             inner: TryLockFileOp {
-                inner: TryLockFile::exclusive(file.to_shared_fd(), 60, 4),
+                inner: native_op,
                 reservation: Some(reservation),
             },
             completion_port: Runtime::with_current(|runtime| runtime.as_raw_fd()),
@@ -1087,9 +1107,8 @@ mod tests {
         completed: Rc<Cell<bool>>,
     }
 
-    // SAFETY: the runtime retains this wrapper and its inner operation until
-    // it consumes the queued completion; every operation method forwards the
-    // same control, OVERLAPPED storage, and result to the inner operation.
+    // SAFETY: the native lock has already completed. The runtime retains its
+    // operation and reservation until it consumes the queued callback packet.
     unsafe impl OpCode for ControlledTryLockCompletion {
         type Control = ();
 
@@ -1099,48 +1118,41 @@ mod tests {
 
         unsafe fn operate(
             &mut self,
-            control: &mut Self::Control,
+            _control: &mut Self::Control,
             overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
         ) -> std::task::Poll<io::Result<usize>> {
-            // SAFETY: the runtime pins this operation and provides its live
-            // OVERLAPPED storage to both the real driver call and queued
-            // packet.
-            match unsafe { self.inner.operate(control, overlapped) } {
-                std::task::Poll::Ready(Ok(_)) => {
-                    // SAFETY: `overlapped` is live runtime-owned storage and
-                    // the accepted driver test uses this controlled packet
-                    // pattern only after the real syscall has completed.
-                    unsafe {
-                        (*overlapped).Internal = 0;
-                        (*overlapped).InternalHigh = 0;
-                    }
-                    // SAFETY: this port belongs to the runtime supplying the
-                    // OVERLAPPED pointer, which remains owned until dequeue.
-                    let posted = unsafe {
-                        windows_sys::Win32::System::IO::PostQueuedCompletionStatus(
-                            self.completion_port as _,
-                            0,
-                            0,
-                            overlapped,
-                        )
-                    };
-                    if posted == 0 {
-                        std::task::Poll::Ready(Err(io::Error::last_os_error()))
-                    } else {
-                        self.queued.set(true);
-                        std::task::Poll::Pending
-                    }
-                }
-                result => result,
+            // The separate native operation already acquired the lock. This
+            // stage only delays map reconciliation until the packet is read.
+            // SAFETY: the runtime pins this operation and supplies its live
+            // OVERLAPPED storage until it consumes the queued packet.
+            unsafe {
+                (*overlapped).Internal = 0;
+                (*overlapped).InternalHigh = 0;
+            }
+            // SAFETY: this port belongs to the runtime supplying the live
+            // OVERLAPPED pointer and remains open through completion.
+            let posted = unsafe {
+                windows_sys::Win32::System::IO::PostQueuedCompletionStatus(
+                    self.completion_port as _,
+                    0,
+                    0,
+                    overlapped,
+                )
+            };
+            if posted == 0 {
+                std::task::Poll::Ready(Err(io::Error::last_os_error()))
+            } else {
+                self.queued.set(true);
+                std::task::Poll::Pending
             }
         }
 
         fn cancel(
             &mut self,
-            control: &mut Self::Control,
-            overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+            _control: &mut Self::Control,
+            _overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
         ) -> io::Result<()> {
-            self.inner.cancel(control, overlapped)
+            Ok(())
         }
 
         unsafe fn set_result(
