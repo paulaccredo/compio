@@ -843,6 +843,8 @@ async fn completed_lock_future_drop_keeps_native_lock_held() {
     drop(acquisition);
 
     assert!(contender.try_lock_shared(40, 4).await.is_err());
+    file.unlock(40, 4).await.unwrap();
+    contender.try_lock_shared(40, 4).await.unwrap();
 }
 
 #[cfg(windows)]

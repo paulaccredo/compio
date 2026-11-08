@@ -712,6 +712,53 @@ mod tests {
         drop(keepalive);
     }
 
+    #[test]
+    fn release_reservation_keeps_cleanup_owner_alive_across_runtime_teardown() {
+        let tempfile = tempfile::NamedTempFile::new().unwrap();
+        let path = tempfile.path().to_path_buf();
+        let runtime = Runtime::new().unwrap();
+        let (file, mut reservation) = runtime.block_on(async {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .await
+                .unwrap();
+            file.try_lock_exclusive(88, 4).await.unwrap();
+            let reservation = file
+                .locks
+                .try_reserve_release(88, 4)
+                .expect("held lock should allow a release reservation");
+            (file, reservation)
+        });
+
+        drop(file);
+        drop(runtime);
+
+        let runtime = Runtime::new().unwrap();
+        let contender = runtime.block_on(async {
+            let contender = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .await
+                .unwrap();
+            let error = contender.try_lock_exclusive(88, 4).await.unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+            );
+            contender
+        });
+
+        assert!(reservation.complete(false));
+        drop(reservation);
+        runtime.block_on(async {
+            acquire_exclusive_after_cleanup(&contender, 88, 4).await;
+            contender.unlock(88, 4).await.unwrap();
+        });
+    }
+
     #[compio_macros::test]
     async fn completion_callback_records_lock_before_operation_drop() {
         let tempfile = tempfile::NamedTempFile::new().unwrap();
@@ -804,6 +851,64 @@ mod tests {
     }
 
     #[compio_macros::test]
+    async fn completion_is_recorded_before_submit_future_is_consumed() {
+        let tempfile = tempfile::NamedTempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tempfile.path())
+            .await
+            .unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tempfile.path())
+            .await
+            .unwrap();
+        let reservation = file.locks.try_reserve(60, 4, true).unwrap();
+        let queued = Rc::new(Cell::new(false));
+        let completed = Rc::new(Cell::new(false));
+        let op = ControlledTryLockCompletion {
+            inner: TryLockFileOp {
+                inner: TryLockFile::exclusive(file.to_shared_fd(), 60, 4),
+                reservation: Some(reservation),
+            },
+            completion_port: Runtime::with_current(|runtime| runtime.as_raw_fd()),
+            queued: queued.clone(),
+            completed: completed.clone(),
+        };
+        let mut submit = Box::pin(Runtime::with_current(|runtime| runtime.submit(op)));
+        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
+
+        assert!(submit.as_mut().poll(&mut context).is_pending());
+        assert!(
+            queued.get(),
+            "real lock success must queue the controlled packet"
+        );
+        assert!(!completed.get(), "callback must await packet consumption");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !completed.get() {
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "controlled completion packet was not observed"
+            );
+            let timeout = (deadline - now).min(Duration::from_millis(100));
+            Runtime::with_current(|runtime| runtime.poll_with(Some(timeout)));
+        }
+
+        assert_eq!(file.locks.count_at(64), Some(1));
+        let error = contender.try_lock_shared(60, 4).await.unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+        );
+        drop(submit);
+        assert_eq!(file.locks.count_at(64), Some(1));
+    }
+
+    #[compio_macros::test]
     async fn discarded_queued_unlock_keeps_state_until_success_completion() {
         let tempfile = tempfile::NamedTempFile::new().unwrap();
         let file = OpenOptions::new()
@@ -858,6 +963,74 @@ mod tests {
         assert!(completed.get());
         assert_eq!(file.locks.count_at(68), None);
         contender.try_lock_exclusive(64, 4).await.unwrap();
+    }
+
+    #[compio_macros::test]
+    async fn discarded_pending_cancelled_unlock_keeps_map_and_native_lock() {
+        use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_OPERATION_ABORTED};
+
+        let tempfile = tempfile::NamedTempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tempfile.path())
+            .await
+            .unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tempfile.path())
+            .await
+            .unwrap();
+        file.try_lock_exclusive(80, 4).await.unwrap();
+
+        let reservation = file.locks.try_reserve_release(80, 4).unwrap();
+        let queued = Rc::new(Cell::new(false));
+        let cancel_requested = Rc::new(Cell::new(false));
+        let completed = Rc::new(Cell::new(false));
+        let completion_error = Rc::new(Cell::new(None));
+        let op = ControlledCancelledUnlock {
+            inner: UnlockFileOp {
+                inner: UnlockFile::new(file.to_shared_fd(), 80, 4),
+                reservation: Some(reservation),
+            },
+            completion_port: Runtime::with_current(|runtime| runtime.as_raw_fd()),
+            queued: queued.clone(),
+            cancel_requested: cancel_requested.clone(),
+            completed: completed.clone(),
+            completion_error: completion_error.clone(),
+        };
+        let mut submit = Box::pin(Runtime::with_current(|runtime| runtime.submit(op)));
+        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
+
+        assert!(submit.as_mut().poll(&mut context).is_pending());
+        assert!(queued.get(), "controlled cancelled result must be queued");
+        assert!(!completed.get(), "map state must wait for the result");
+        assert_eq!(file.locks.test_state_at(84), Some((1, true, 0, true)));
+        drop(submit);
+        assert!(
+            cancel_requested.get(),
+            "dropping submit must request cancel"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !completed.get() {
+            let now = Instant::now();
+            assert!(now < deadline, "cancelled completion was not observed");
+            let timeout = (deadline - now).min(Duration::from_millis(100));
+            Runtime::with_current(|runtime| runtime.poll_with(Some(timeout)));
+        }
+
+        assert_eq!(completion_error.get(), Some(ERROR_OPERATION_ABORTED as i32));
+        assert_eq!(file.locks.test_state_at(84), Some((1, true, 0, false)));
+        let error = contender.try_lock_exclusive(80, 4).await.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as i32));
+
+        // The test control never called UnlockFileEx, so the real lock remains
+        // held; a real unlock proves the retained map can still release it.
+        file.unlock(80, 4).await.unwrap();
+        assert_eq!(file.locks.test_state_at(84), None);
+        contender.try_lock_exclusive(80, 4).await.unwrap();
     }
 
     #[compio_macros::test]
@@ -996,6 +1169,15 @@ mod tests {
         callback_completed: Rc<Cell<bool>>,
     }
 
+    struct ControlledCancelledUnlock {
+        inner: UnlockFileOp,
+        completion_port: compio_driver::RawFd,
+        queued: Rc<Cell<bool>>,
+        cancel_requested: Rc<Cell<bool>>,
+        completed: Rc<Cell<bool>>,
+        completion_error: Rc<Cell<Option<i32>>>,
+    }
+
     // SAFETY: this test wrapper completes immediately and forwards the same
     // operation storage to the callback; it does not submit native I/O.
     unsafe impl OpCode for ControlledUnlockCallbackError {
@@ -1032,6 +1214,72 @@ mod tests {
             unsafe { self.inner.set_result(control, result, extra) };
             self.callback_completed
                 .set(self.inner.reservation.is_none());
+        }
+    }
+
+    // SAFETY: this test operation posts one controlled cancelled result for
+    // its runtime-owned OVERLAPPED and forwards reconciliation to the wrapped
+    // unlock operation. It does not issue a native unlock.
+    unsafe impl OpCode for ControlledCancelledUnlock {
+        type Control = ();
+
+        fn op_type(&self, control: &Self::Control) -> OpType {
+            self.inner.op_type(control)
+        }
+
+        unsafe fn operate(
+            &mut self,
+            _control: &mut Self::Control,
+            overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+        ) -> std::task::Poll<io::Result<usize>> {
+            // STATUS_CANCELLED is the completion status delivered for this
+            // controlled request; the test's native lock remains untouched.
+            const STATUS_CANCELLED: usize = 0xC000_0120;
+            // SAFETY: the runtime pins the operation and supplies its live
+            // OVERLAPPED storage until it consumes the posted completion.
+            unsafe {
+                (*overlapped).Internal = STATUS_CANCELLED;
+                (*overlapped).InternalHigh = 0;
+            }
+            // SAFETY: this port belongs to the runtime supplying the live
+            // OVERLAPPED pointer and remains open through completion.
+            let posted = unsafe {
+                windows_sys::Win32::System::IO::PostQueuedCompletionStatus(
+                    self.completion_port as _,
+                    0,
+                    0,
+                    overlapped,
+                )
+            };
+            if posted == 0 {
+                std::task::Poll::Ready(Err(io::Error::last_os_error()))
+            } else {
+                self.queued.set(true);
+                std::task::Poll::Pending
+            }
+        }
+
+        fn cancel(
+            &mut self,
+            _control: &mut Self::Control,
+            _overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+        ) -> io::Result<()> {
+            self.cancel_requested.set(true);
+            Ok(())
+        }
+
+        unsafe fn set_result(
+            &mut self,
+            control: &mut Self::Control,
+            result: &io::Result<usize>,
+            extra: &compio_driver::Extra,
+        ) {
+            // SAFETY: the runtime delivers this controlled completion to the
+            // same wrapped operation and its reservation.
+            unsafe { self.inner.set_result(control, result, extra) };
+            self.completion_error
+                .set(result.as_ref().err().and_then(io::Error::raw_os_error));
+            self.completed.set(self.inner.reservation.is_none());
         }
     }
 
