@@ -1,3 +1,8 @@
+#[cfg(windows)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::{
     io::{self, Write as _},
     net::{TcpListener, TcpStream},
@@ -875,6 +880,36 @@ fn controlled_pending_unlock_cancel_reports_actual_range_state() {
 }
 
 #[cfg(windows)]
+#[test]
+fn wait_for_controlled_completion_consumes_prepolled_result() {
+    let mut driver = Proactor::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lock.tmp");
+    std::fs::File::create(&path).unwrap();
+    let owner = open_lock_test_handle(&path);
+    let observed = Arc::new(AtomicBool::new(false));
+    let op = ControlledRangeCompletion::unlock(UnlockFile::new(owner, 64, 8), driver.as_raw_fd())
+        .with_observed_completion(Arc::clone(&observed));
+    let key = match driver.push(op) {
+        PushEntry::Pending(key) => key,
+        PushEntry::Ready(_) => panic!("controlled completion must return pending"),
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while !observed.load(Ordering::Acquire) {
+        let now = std::time::Instant::now();
+        assert!(now < deadline, "controlled completion was not observed");
+        match driver.poll(Some((deadline - now).min(Duration::from_millis(100)))) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(error) => panic!("polling controlled completion failed: {error}"),
+        }
+    }
+    let completion = wait_for_controlled_completion(&mut driver, key);
+    completion.0.unwrap();
+}
+
+#[cfg(windows)]
 fn push_and_wait_lock_observing<O: OpCode + 'static>(
     driver: &mut Proactor,
     op: O,
@@ -908,6 +943,11 @@ fn wait_for_controlled_completion(
 ) -> BufResult<usize, ControlledRangeCompletion> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
+        match driver.pop(key) {
+            PushEntry::Pending(next) => key = next,
+            PushEntry::Ready(result) => return result,
+        }
+
         let now = std::time::Instant::now();
         assert!(
             now < deadline,
@@ -915,12 +955,8 @@ fn wait_for_controlled_completion(
         );
         match driver.poll(Some((deadline - now).min(Duration::from_millis(100)))) {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
             Err(error) => panic!("polling controlled completion failed: {error}"),
-        }
-        match driver.pop(key) {
-            PushEntry::Pending(next) => key = next,
-            PushEntry::Ready(result) => return result,
         }
     }
 }
@@ -937,6 +973,7 @@ enum ControlledRangeOperation {
 struct ControlledRangeCompletion {
     operation: ControlledRangeOperation,
     completion_port: compio_driver::RawFd,
+    observed_completion: Option<Arc<AtomicBool>>,
 }
 
 #[cfg(windows)]
@@ -948,6 +985,7 @@ impl ControlledRangeCompletion {
         Self {
             operation: ControlledRangeOperation::Lock(operation),
             completion_port,
+            observed_completion: None,
         }
     }
 
@@ -958,7 +996,13 @@ impl ControlledRangeCompletion {
         Self {
             operation: ControlledRangeOperation::Unlock(operation),
             completion_port,
+            observed_completion: None,
         }
+    }
+
+    fn with_observed_completion(mut self, observed_completion: Arc<AtomicBool>) -> Self {
+        self.observed_completion = Some(observed_completion);
+        self
     }
 }
 
@@ -1006,6 +1050,17 @@ unsafe impl OpCode for ControlledRangeCompletion {
         match &mut self.operation {
             ControlledRangeOperation::Lock(op) => OpCode::cancel(op, control, optr),
             ControlledRangeOperation::Unlock(op) => OpCode::cancel(op, control, optr),
+        }
+    }
+
+    unsafe fn set_result(
+        &mut self,
+        _control: &mut Self::Control,
+        _result: &io::Result<usize>,
+        _extra: &Extra,
+    ) {
+        if let Some(observed_completion) = &self.observed_completion {
+            observed_completion.store(true, Ordering::Release);
         }
     }
 }
